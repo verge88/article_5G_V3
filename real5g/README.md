@@ -40,3 +40,13 @@ The ML stage is one-class / anomaly detection trained only on normal observation
 - `ActiveProbe_OCSVM`: one-class SVM on the same proposed feature family.
 
 The principal scientific comparison is `PassiveZone_IF` vs `ActiveProbe_IF`.
+
+## Final validated run
+
+The corrected real-software run completed successfully in GitHub Actions:
+
+- run: https://github.com/verge88/article_5G_V3/actions/runs/39121474105
+- complete results: [RESULTS.md](RESULTS.md)
+- active-probe Isolation Forest: F1 = **0.9736**, FPR = **0.0000**, stealth top-1 localization = **0.9429**;
+- packet capture: **46,838 SBI TCP/8000 packets** and **1,448 SCTP packets**;
+- all 19 accepted normal registrations succeeded.
