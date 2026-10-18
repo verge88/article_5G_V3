@@ -1,0 +1,138 @@
+name: Real free5GC + UERANSIM experiment
+
+on:
+  push:
+    branches: [real-free5gc-ci]
+    paths:
+      - REAL_TRIGGER
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  real-5g-testbed:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      FREE5GC_COMPOSE_SHA: "235ef1b91ceacebb07f4118384f2c4190f431098"
+      FREE5GC_IMAGE_TAG: "v4.3.0"
+      FREE5GC_ADDITIONAL_IMAGE_TAG: "latest"
+      PYTHONHASHSEED: "0"
+    steps:
+      - name: Checkout article repository
+        uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
+          docker system prune -af || true
+          df -h
+
+      - name: Install host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl iproute2 tcpdump lksctp-tools
+          sudo modprobe sctp || true
+          sudo mkdir -p /dev/net
+          if [ ! -e /dev/net/tun ]; then
+            sudo mknod /dev/net/tun c 10 200
+          fi
+          sudo chmod 666 /dev/net/tun
+          ls -l /dev/net/tun
+          lsmod | grep -E 'sctp|tun' || true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install analysis dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy==2.1.3 pandas==2.2.3 scikit-learn==1.5.2 matplotlib==3.9.2 tabulate==0.9.0
+
+      - name: Clone pinned free5GC compose
+        run: |
+          git clone https://github.com/free5gc/free5gc-compose.git testbed/free5gc-compose
+          cd testbed/free5gc-compose
+          git checkout "$FREE5GC_COMPOSE_SHA"
+          echo "$FREE5GC_COMPOSE_SHA" > ../../free5gc-compose.sha
+
+      - name: Pull and start real 5G control plane
+        working-directory: testbed/free5gc-compose
+        run: |
+          set -euxo pipefail
+          export COMPOSE_PROJECT_NAME=free5gc
+          docker compose pull db free5gc-nrf free5gc-nssf free5gc-udr free5gc-udm free5gc-ausf free5gc-pcf free5gc-amf free5gc-webui ueransim
+          docker compose up -d db
+          sleep 3
+          docker compose up -d free5gc-nrf
+          sleep 3
+          docker compose up -d free5gc-nssf free5gc-udr free5gc-udm free5gc-ausf free5gc-pcf free5gc-amf free5gc-webui
+          docker compose up -d --no-deps free5gc-smf || true
+          sleep 12
+          docker compose up -d --no-deps ueransim
+          sleep 8
+          docker ps -a
+          docker network ls
+          docker logs --tail 120 ueransim || true
+          docker logs --tail 80 amf || true
+
+      - name: Start HTTP/2 probe helper
+        run: |
+          set -euxo pipefail
+          NET="$(docker network ls --format '{{.Name}}' | grep '^free5gc_privnet$' | head -1)"
+          test -n "$NET"
+          docker run -d --name probe-helper --network "$NET" alpine:3.20 sleep infinity
+          docker exec probe-helper apk add --no-cache curl >/dev/null
+          docker exec probe-helper curl -sS --max-time 2 http://nrf.free5gc.org:8000/ -o /dev/null || true
+
+      - name: Run real free5GC + UERANSIM experiment
+        run: |
+          mkdir -p results_real5g/raw_logs
+          sudo tcpdump -i br-free5gc -s 160 -w results_real5g/sbi_ngap_capture.pcap '(tcp port 8000) or sctp' >/tmp/tcpdump.log 2>&1 &
+          echo $! > /tmp/tcpdump.pid
+          python real5g/run_real_testbed.py --compose-dir testbed/free5gc-compose --out results_real5g --normal-runs 18 --runs-per-scenario 7
+          sudo kill "$(cat /tmp/tcpdump.pid)" || true
+          sleep 1
+          SBI_PACKETS="$(sudo tcpdump -nn -r results_real5g/sbi_ngap_capture.pcap 'tcp port 8000' 2>/dev/null | wc -l)"
+          SCTP_PACKETS="$(sudo tcpdump -nn -r results_real5g/sbi_ngap_capture.pcap 'sctp' 2>/dev/null | wc -l)"
+          printf '{"sbi_tcp_8000_packets":%s,"sctp_packets":%s}\n' "$SBI_PACKETS" "$SCTP_PACKETS" > results_real5g/pcap_evidence.json
+          test "$SBI_PACKETS" -gt 0
+          test "$SCTP_PACKETS" -gt 0
+          sudo chown -R "$USER":"$USER" results_real5g
+          python real5g/analyze_real_testbed.py --input results_real5g/real5g_node_observations.csv --events results_real5g/real5g_events.csv --out results_real5g
+          cat results_real5g/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save complete testbed evidence
+        if: always()
+        run: |
+          mkdir -p results_real5g/raw_logs
+          for c in nrf amf ausf udm udr nssf pcf smf ueransim webui mongodb; do
+            docker logs "$c" > "results_real5g/raw_logs/${c}.log" 2>&1 || true
+          done
+          docker ps -a > results_real5g/docker_ps.txt || true
+          docker images --digests > results_real5g/docker_images.txt || true
+          docker inspect nrf amf ausf udm udr nssf pcf smf ueransim > results_real5g/docker_inspect.json 2>/dev/null || true
+          cp free5gc-compose.sha results_real5g/ || true
+          sudo chown -R "$USER":"$USER" results_real5g || true
+          du -sh results_real5g || true
+
+      - name: Upload real testbed artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-free5gc-ueransim-results
+          path: results_real5g/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Tear down
+        if: always()
+        working-directory: testbed/free5gc-compose
+        run: |
+          export COMPOSE_PROJECT_NAME=free5gc
+          docker rm -f probe-helper || true
+          docker compose down -v --remove-orphans || true
