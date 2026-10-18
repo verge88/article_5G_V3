@@ -287,14 +287,16 @@ def simple_node_baseline(train_nodes, test_nodes, test_events, method):
     return pred_df, pd.DataFrame(loc_rows)
 
 
-def registration_slo(train_events, test_events):
-    vals = train_events.canary_registration_latency_ms.astype(float).values
+def registration_slo(train_events, test_events, channel="canary", method="UERegistrationSLO"):
+    lat_col = f"{channel}_registration_latency_ms"
+    ok_col = f"{channel}_registration_success"
+    vals = train_events[lat_col].astype(float).values
     threshold = float(np.quantile(vals, 0.95))
     out = test_events.copy()
-    failure_score = np.where(out.canary_registration_success.astype(float).values < 1.0, threshold * 4, 0.0)
-    out["score"] = np.maximum(out.canary_registration_latency_ms.astype(float).values, failure_score)
-    out["pred"] = ((out.canary_registration_success < 1.0) | (out.canary_registration_latency_ms > threshold)).astype(int)
-    out["method"] = "UERegistrationSLO"
+    failure_score = np.where(out[ok_col].astype(float).values < 1.0, threshold * 4, 0.0)
+    out["score"] = np.maximum(out[lat_col].astype(float).values, failure_score)
+    out["pred"] = ((out[ok_col] < 1.0) | (out[lat_col] > threshold)).astype(int)
+    out["method"] = method
     return out
 
 
@@ -317,6 +319,7 @@ def combined_rules(train_nodes, test_nodes, train_events, test_events):
 
 
 def bootstrap_ci(preds, locs, iterations=1000):
+    """Hierarchical bootstrap: resample runner replicates, then events within class."""
     rows = []
     metric_names = ["roc_auc", "pr_auc", "balanced_accuracy", "mcc", "macro_f1", "positive_f1",
                     "precision", "sensitivity", "specificity", "fpr"]
@@ -327,93 +330,121 @@ def bootstrap_ci(preds, locs, iterations=1000):
         point["localization_top2"] = float(loc.top2.mean()) if len(loc) else np.nan
         point["localization_mrr"] = float(loc.rr.mean()) if len(loc) else np.nan
         boots = {k: [] for k in metric_names + ["localization_top1", "localization_top2", "localization_mrr"]}
-
-        groups = {(r, y): g.index.to_numpy() for (r, y), g in df.groupby(["replicate", "label"])}
-        loc_groups = {r: g.index.to_numpy() for r, g in loc.groupby("replicate")} if len(loc) else {}
+        reps = sorted(df.replicate.unique().tolist())
 
         for _ in range(iterations):
-            idx = []
-            for inds in groups.values():
-                idx.extend(RNG.choice(inds, size=len(inds), replace=True).tolist())
-            bdf = df.loc[idx]
-            try:
-                bm = binary_metrics(bdf.label.values, bdf.pred.values, bdf.score.values)
-                for k in metric_names:
-                    boots[k].append(bm[k])
-            except Exception:
-                pass
-            if len(loc):
-                lidx = []
-                for inds in loc_groups.values():
-                    lidx.extend(RNG.choice(inds, size=len(inds), replace=True).tolist())
-                b = loc.loc[lidx]
+            sampled_reps = RNG.choice(reps, size=len(reps), replace=True)
+            chunks = []
+            lchunks = []
+            for r in sampled_reps:
+                rdf = df[df.replicate == r]
+                for y in sorted(rdf.label.unique()):
+                    part = rdf[rdf.label == y]
+                    if len(part):
+                        ix = RNG.integers(0, len(part), size=len(part))
+                        chunks.append(part.iloc[ix])
+                if len(loc):
+                    lp = loc[loc.replicate == r]
+                    if len(lp):
+                        ix = RNG.integers(0, len(lp), size=len(lp))
+                        lchunks.append(lp.iloc[ix])
+            if chunks:
+                bdf = pd.concat(chunks, ignore_index=True)
+                try:
+                    bm = binary_metrics(bdf.label.values, bdf.pred.values, bdf.score.values)
+                    for k in metric_names:
+                        boots[k].append(bm[k])
+                except Exception:
+                    pass
+            if lchunks:
+                b = pd.concat(lchunks, ignore_index=True)
                 boots["localization_top1"].append(float(b.top1.mean()))
                 boots["localization_top2"].append(float(b.top2.mean()))
                 boots["localization_mrr"].append(float(b.rr.mean()))
 
         row = {"method": method}
-        for k, v in point.items():
-            row[k] = v
+        row.update(point)
         for k, vals in boots.items():
             vals = [v for v in vals if pd.notna(v)]
-            if vals:
-                row[f"{k}_ci_low"] = float(np.quantile(vals, 0.025))
-                row[f"{k}_ci_high"] = float(np.quantile(vals, 0.975))
-            else:
-                row[f"{k}_ci_low"] = np.nan
-                row[f"{k}_ci_high"] = np.nan
+            row[f"{k}_ci_low"] = float(np.quantile(vals, 0.025)) if vals else np.nan
+            row[f"{k}_ci_high"] = float(np.quantile(vals, 0.975)) if vals else np.nan
         rows.append(row)
     return pd.DataFrame(rows)
 
 
 def paired_bootstrap_differences(preds, locs, reference="Active_IF", iterations=1000):
+    """Paired hierarchical bootstrap over complete runner replicates and matched events."""
     out = []
-    ref = preds[preds.method == reference].set_index(["replicate", "event_id"])
-    ref_loc = locs[locs.method == reference].set_index(["replicate", "event_id"]) if len(locs) else pd.DataFrame()
+    keys = ["replicate", "event_id"]
+    ref = preds[preds.method == reference][keys + ["label", "pred", "score"]].rename(
+        columns={"pred": "ref_pred", "score": "ref_score"}
+    )
+    ref_loc = locs[locs.method == reference][keys + ["top1"]].rename(
+        columns={"top1": "ref_top1"}
+    ) if len(locs) else pd.DataFrame()
+
     for method in sorted(set(preds.method) - {reference, "AlwaysAnomaly"}):
-        cmp = preds[preds.method == method].set_index(["replicate", "event_id"])
-        common = ref.index.intersection(cmp.index)
-        if not len(common):
+        cmp = preds[preds.method == method][keys + ["pred", "score"]].rename(
+            columns={"pred": "cmp_pred", "score": "cmp_score"}
+        )
+        d = ref.merge(cmp, on=keys, how="inner")
+        if not len(d):
             continue
-        d = pd.DataFrame({
-            "label": ref.loc[common, "label"],
-            "ref_pred": ref.loc[common, "pred"],
-            "ref_score": ref.loc[common, "score"],
-            "cmp_pred": cmp.loc[common, "pred"],
-            "cmp_score": cmp.loc[common, "score"],
-        })
-        diffs_ba, diffs_mcc = [], []
+        point_ba = balanced_accuracy_score(d.label, d.ref_pred) - balanced_accuracy_score(d.label, d.cmp_pred)
+        point_mcc = matthews_corrcoef(d.label, d.ref_pred) - matthews_corrcoef(d.label, d.cmp_pred)
+
+        reps = sorted(d.replicate.unique().tolist())
+        ba_boot, mcc_boot = [], []
         for _ in range(iterations):
-            ix = RNG.choice(np.arange(len(d)), size=len(d), replace=True)
-            b = d.iloc[ix]
-            diffs_ba.append(
-                balanced_accuracy_score(b.label, b.ref_pred) - balanced_accuracy_score(b.label, b.cmp_pred)
+            sampled_reps = RNG.choice(reps, size=len(reps), replace=True)
+            chunks = []
+            for r in sampled_reps:
+                rd = d[d.replicate == r]
+                for y in sorted(rd.label.unique()):
+                    part = rd[rd.label == y]
+                    if len(part):
+                        ix = RNG.integers(0, len(part), size=len(part))
+                        chunks.append(part.iloc[ix])
+            b = pd.concat(chunks, ignore_index=True)
+            ba_boot.append(
+                balanced_accuracy_score(b.label, b.ref_pred) -
+                balanced_accuracy_score(b.label, b.cmp_pred)
             )
-            diffs_mcc.append(
-                matthews_corrcoef(b.label, b.ref_pred) - matthews_corrcoef(b.label, b.cmp_pred)
+            mcc_boot.append(
+                matthews_corrcoef(b.label, b.ref_pred) -
+                matthews_corrcoef(b.label, b.cmp_pred)
             )
+
         row = {
             "reference": reference,
             "comparison": method,
-            "delta_balanced_accuracy": balanced_accuracy_score(d.label, d.ref_pred) - balanced_accuracy_score(d.label, d.cmp_pred),
-            "delta_balanced_accuracy_ci_low": float(np.quantile(diffs_ba, 0.025)),
-            "delta_balanced_accuracy_ci_high": float(np.quantile(diffs_ba, 0.975)),
-            "delta_mcc": matthews_corrcoef(d.label, d.ref_pred) - matthews_corrcoef(d.label, d.cmp_pred),
-            "delta_mcc_ci_low": float(np.quantile(diffs_mcc, 0.025)),
-            "delta_mcc_ci_high": float(np.quantile(diffs_mcc, 0.975)),
+            "delta_balanced_accuracy": point_ba,
+            "delta_balanced_accuracy_ci_low": float(np.quantile(ba_boot, 0.025)),
+            "delta_balanced_accuracy_ci_high": float(np.quantile(ba_boot, 0.975)),
+            "delta_mcc": point_mcc,
+            "delta_mcc_ci_low": float(np.quantile(mcc_boot, 0.025)),
+            "delta_mcc_ci_high": float(np.quantile(mcc_boot, 0.975)),
         }
+
         if len(ref_loc) and method in set(locs.method):
-            cl = locs[locs.method == method].set_index(["replicate", "event_id"])
-            ci = ref_loc.index.intersection(cl.index)
-            if len(ci):
-                delta = ref_loc.loc[ci, "top1"].values - cl.loc[ci, "top1"].values
-                boot = []
-                for _ in range(iterations):
-                    ix = RNG.choice(np.arange(len(delta)), size=len(delta), replace=True)
-                    boot.append(float(np.mean(delta[ix])))
+            cl = locs[locs.method == method][keys + ["top1"]].rename(columns={"top1": "cmp_top1"})
+            ld = ref_loc.merge(cl, on=keys, how="inner")
+            if len(ld):
+                delta = ld.ref_top1.values - ld.cmp_top1.values
                 row["delta_localization_top1"] = float(np.mean(delta))
-                row["delta_localization_top1_ci_low"] = float(np.quantile(boot, 0.025))
-                row["delta_localization_top1_ci_high"] = float(np.quantile(boot, 0.975))
+                lreps = sorted(ld.replicate.unique().tolist())
+                lboot = []
+                for _ in range(iterations):
+                    sampled_reps = RNG.choice(lreps, size=len(lreps), replace=True)
+                    vals = []
+                    for r in sampled_reps:
+                        part = ld[ld.replicate == r]
+                        ix = RNG.integers(0, len(part), size=len(part))
+                        b = part.iloc[ix]
+                        vals.extend((b.ref_top1.values - b.cmp_top1.values).tolist())
+                    lboot.append(float(np.mean(vals)))
+                row["delta_localization_top1_ci_low"] = float(np.quantile(lboot, 0.025))
+                row["delta_localization_top1_ci_high"] = float(np.quantile(lboot, 0.975))
         out.append(row)
     return pd.DataFrame(out)
 
@@ -486,7 +517,10 @@ def main():
         simple_pairs = []
         for m in ["RootProbeZ", "BlackboxSLO", "BusinessLatencyZ", "BusinessSLO"]:
             simple_pairs.append(simple_node_baseline(train_nodes, test_nodes, test_events, m))
-        reg = registration_slo(train_events, test_events)
+        reg = registration_slo(train_events, test_events, "canary", "UERegistrationSLO")
+        workload_reg = registration_slo(
+            train_events, test_events, "workload", "WorkloadRegistrationSLO"
+        )
         combo_p, combo_l = combined_rules(train_nodes, test_nodes, train_events, test_events)
 
         always = test_events.copy()
@@ -494,7 +528,7 @@ def main():
         always["pred"] = 1
         always["method"] = "AlwaysAnomaly"
 
-        fold_preds = [p1, p2, p3] + [x[0] for x in simple_pairs] + [reg, combo_p, always]
+        fold_preds = [p1, p2, p3] + [x[0] for x in simple_pairs] + [reg, workload_reg, combo_p, always]
         fold_locs = [l1, l2, l3] + [x[1] for x in simple_pairs] + [combo_l]
 
         for df in fold_preds:
@@ -551,7 +585,7 @@ def main():
 
     # Plots.
     order = [
-        "AlwaysAnomaly", "BlackboxSLO", "RootProbeZ", "UERegistrationSLO",
+        "AlwaysAnomaly", "BlackboxSLO", "RootProbeZ", "UERegistrationSLO", "WorkloadRegistrationSLO",
         "BusinessSLO", "BusinessLatencyZ", "CombinedRules",
         "Passive_IF", "PassiveZone_IF", "Active_IF",
     ]
@@ -587,6 +621,7 @@ def main():
     active = summary[summary.method == "Active_IF"].iloc[0]
     business = summary[summary.method == "BusinessSLO"].iloc[0]
     reg = summary[summary.method == "UERegistrationSLO"].iloc[0]
+    workload_reg = summary[summary.method == "WorkloadRegistrationSLO"].iloc[0]
     black = summary[summary.method == "BlackboxSLO"].iloc[0]
     passive = summary[summary.method == "PassiveZone_IF"].iloc[0]
 
@@ -601,17 +636,17 @@ probe can remain healthy while a real UE registration traverses the impaired bus
 
 A real UERANSIM canary UE registration is the active control transaction. Prometheus blackbox_exporter
 v0.28.0 is run as a separate baseline. The experiment also includes a probe-aware evasion condition in which
-the controlled fault explicitly exempts the canary SUPI while ordinary UE traffic remains impaired.
+the adversarial condition suspends manipulation during the recognizable canary/control window and resumes it for ordinary UE traffic.
 
 ## Statistical design
 
 - complete runner replicates: {len(reps)}
 - all scenarios are randomly interleaved inside every runner;
 - each held-out fold is an entire GitHub runner; models train only on legitimate events from the other runners;
-- negative events include single-UE normal operation, 3-UE benign bursts and 5-UE benign heavy load;
+- negative events include single-UE normal operation, 3-UE benign bursts, 5-UE benign heavy load and time-spaced drift/stability samples;
 - primary controlled-fault events that did not actually reach the configured business path are excluded and listed separately;
 - Isolation Forest contamination is fixed at 0.05; no threshold is estimated from four validation points;
-- confidence intervals use {args.bootstrap} stratified bootstrap resamples of held-out predictions;
+- confidence intervals use {args.bootstrap} hierarchical bootstrap resamples: runner replicates are resampled first, followed by events within class;
 - localization candidates are explicitly AUSF, UDM and UDR (random Top-1 baseline = 1/3);
 - localization uses a separate one-class model per NF, with no NF identifier as an input feature.
 
@@ -648,6 +683,10 @@ AMF--AUSF--UDM--UDR. This removes the previous raw-median comparison across unli
 - balanced accuracy: {black.balanced_accuracy:.3f}
 - MCC: {black.mcc:.3f}
 
+**Ordinary-workload UE registration SLO**
+- balanced accuracy: {workload_reg.balanced_accuracy:.3f}
+- MCC: {workload_reg.mcc:.3f}
+
 **Passive + normalized-neighbor model**
 - balanced accuracy: {passive.balanced_accuracy:.3f}
 - MCC: {passive.mcc:.3f}
@@ -660,14 +699,18 @@ result is that a business-path active control transaction is valuable, while a s
 the tested faults. Conversely, an ML contribution is claimed only if the paired difference is positive with a
 confidence interval that does not include zero on the pre-specified balanced metrics and/or localization.
 
-The probe-aware evasion scenario is reported separately and bounds the independence claim: a canary that can
-be identified by the adversary is not an independent source of evidence.
+The probe-aware evasion scenario is reported separately and bounds the independence claim: a canary/control
+window that can be identified by the adversary is not an independent source of evidence. The ordinary-workload
+registration SLO is retained as a separate operational comparator for this case.
 
 ## Scope
 
 The experiment is a real free5GC/UERANSIM control-plane testbed, but GitHub Actions is not a substitute for
-day-scale operator drift. Cross-runner validation and benign load levels test environment and short-term load
-variation; long-duration drift remains a stated limitation rather than an inferred result.
+day-scale operator drift. Cross-runner validation, three benign load levels and time-spaced stability samples test environment,
+load and medium-duration variation. Day-scale/weekly operator drift and SBI mTLS termination are not tested
+and remain explicit deployment limitations. The pinned free5GC compose uses h2c/HTTP SBI; the internal proxy
+forwards headers transparently, so OAuth-style headers are preserved, but production mTLS/service-mesh behavior
+must be validated separately.
 """
     (out / "summary.md").write_text(report, encoding="utf-8")
 
@@ -675,7 +718,8 @@ variation; long-duration drift remains a stated limitation rather than an inferr
         "outer_validation": "leave-one-GitHub-runner-out",
         "replicates": reps,
         "bootstrap_iterations": args.bootstrap,
-        "negative_classes": ["normal", "benign_burst", "benign_heavy_load"],
+        "bootstrap_design": "hierarchical: resample complete runner replicates, then events within class",
+        "negative_classes": ["normal", "benign_burst", "benign_heavy_load", "drift_legitimate"],
         "localization_candidates": TARGET_NODES,
         "random_localization_top1": 1/3,
         "iforest_contamination": 0.05,
@@ -683,7 +727,9 @@ variation; long-duration drift remains a stated limitation rather than an inferr
         "zone_graph": ADJ,
         "invalid_controlled_fault_events_excluded": len(ineffective),
         "workload_registration_latency_used_as_feature": False,
+        "workload_registration_latency_used_as_simple_operational_baseline": True,
         "canary_registration_latency_used_as_feature_and_simple_baseline": True,
+        "sbi_transport_in_testbed": "h2c/HTTP; mTLS not evaluated",
     }
     (out / "analysis_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
