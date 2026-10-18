@@ -36,7 +36,7 @@ jobs:
 
       - name: Run reproducible experiment
         run: |
-          python experiment.py --out results --seeds 11 29 47
+          python experiment.py --out results --seeds 11 29 47 71 101
 
       - name: Show headline results
         if: always()
