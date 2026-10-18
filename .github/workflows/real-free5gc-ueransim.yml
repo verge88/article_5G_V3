@@ -97,6 +97,11 @@ jobs:
           python real5g/run_real_testbed.py --compose-dir testbed/free5gc-compose --out results_real5g --normal-runs 18 --runs-per-scenario 7
           sudo kill "$(cat /tmp/tcpdump.pid)" || true
           sleep 1
+          SBI_PACKETS="$(sudo tcpdump -nn -r results_real5g/sbi_ngap_capture.pcap 'tcp port 8000' 2>/dev/null | wc -l)"
+          SCTP_PACKETS="$(sudo tcpdump -nn -r results_real5g/sbi_ngap_capture.pcap 'sctp' 2>/dev/null | wc -l)"
+          printf '{"sbi_tcp_8000_packets":%s,"sctp_packets":%s}\n' "$SBI_PACKETS" "$SCTP_PACKETS" > results_real5g/pcap_evidence.json
+          test "$SBI_PACKETS" -gt 0
+          test "$SCTP_PACKETS" -gt 0
           sudo chown -R "$USER":"$USER" results_real5g
           python real5g/analyze_real_testbed.py --input results_real5g/real5g_node_observations.csv --events results_real5g/real5g_events.csv --out results_real5g
           cat results_real5g/summary.md >> "$GITHUB_STEP_SUMMARY"
