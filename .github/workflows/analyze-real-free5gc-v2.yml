@@ -1,0 +1,52 @@
+name: Analyze collected real 5G v2 dataset
+
+on:
+  push:
+    branches: [real-free5gc-v2-ci]
+    paths:
+      - V2_ANALYZE_TRIGGER
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout analysis code
+        uses: actions/checkout@v4
+
+      - name: Download validated collection artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: real-free5gc-ueransim-v2-results
+          path: results_real5g_v2
+          github-token: ${{ github.token }}
+          repository: verge88/article_5G_V3
+          run-id: 39134556003
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy==2.1.3 pandas==2.2.3 scikit-learn==1.5.2 matplotlib==3.9.2 tabulate==0.9.0
+
+      - name: Run blocked cross-validation
+        run: |
+          python -m real5g_v2.evaluate_v2             --nodes results_real5g_v2/nodes_v2.csv             --events results_real5g_v2/events_v2.csv             --out results_real5g_v2
+          cat results_real5g_v2/summary_v2.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload analyzed artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-free5gc-ueransim-v2-analyzed
+          path: results_real5g_v2/
+          retention-days: 30
