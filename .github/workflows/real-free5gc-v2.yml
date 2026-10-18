@@ -155,11 +155,13 @@ jobs:
 
       - name: Tear down
         if: always()
-        working-directory: testbed/free5gc-compose
         run: |
-          export COMPOSE_PROJECT_NAME=free5gc
           docker rm -f sbi-proxy-ausf sbi-proxy-udm sbi-proxy-udr blackbox-exporter || true
-          docker compose down -v --remove-orphans || true
+          if [ -d testbed/free5gc-compose ]; then
+            cd testbed/free5gc-compose
+            export COMPOSE_PROJECT_NAME=free5gc
+            docker compose down -v --remove-orphans || true
+          fi
 
   analyze:
     name: cross-runner-analysis
