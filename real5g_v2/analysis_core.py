@@ -99,6 +99,7 @@ def transform(nodes, events, stats, estats):
     ez.loc[fail, "z_canary_registration"] = np.maximum(
         ez.loc[fail, "z_canary_registration"], 10.0
     )
+    d = d.merge(ez[["event_id", "z_canary_registration"]], on="event_id", how="left")
     return d, ez[["event_id", "z_canary_registration"]]
 
 def feature_columns(method):
@@ -114,6 +115,7 @@ def feature_columns(method):
             "z_blackbox_latency_ms",
             "z_active_stage_ms",
             "stage_missing",
+            "z_canary_registration",
         ]
     raise ValueError(method)
 
