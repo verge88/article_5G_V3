@@ -1,0 +1,10 @@
+modules:
+  http_sbi_root:
+    prober: http
+    timeout: 2s
+    http:
+      method: GET
+      valid_status_codes: [200, 404]
+      enable_http2: true
+      preferred_ip_protocol: ip4
+      ip_protocol_fallback: false
