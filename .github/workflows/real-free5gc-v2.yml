@@ -111,7 +111,7 @@ jobs:
 
       - name: Run blocked cross-validation and statistics
         run: |
-          python real5g_v2/evaluate_v2.py             --nodes results_real5g_v2/nodes_v2.csv             --events results_real5g_v2/events_v2.csv             --out results_real5g_v2
+          python -m real5g_v2.evaluate_v2 --nodes results_real5g_v2/nodes_v2.csv --events results_real5g_v2/events_v2.csv --out results_real5g_v2
           cat results_real5g_v2/summary_v2.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Save reproducibility evidence
