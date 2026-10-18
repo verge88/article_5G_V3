@@ -101,7 +101,7 @@ jobs:
           mkdir -p results_real5g_v2/raw_logs
           sudo tcpdump -i br-free5gc -s 192 -w results_real5g_v2/control_plane_v2.pcap '(tcp port 8000) or sctp' >/tmp/tcpdump-v2.log 2>&1 &
           echo $! > /tmp/tcpdump-v2.pid
-          python real5g_v2/run_experiment_v2.py --out results_real5g_v2 --blocks 8 --subscriber-pool 480
+          python -m real5g_v2.run_experiment_v2 --out results_real5g_v2 --blocks 8 --subscriber-pool 480
           sudo kill "$(cat /tmp/tcpdump-v2.pid)" || true
           sleep 1
           SBI_PACKETS="$(sudo tcpdump -nn -r results_real5g_v2/control_plane_v2.pcap 'tcp port 8000' 2>/dev/null | wc -l)"
