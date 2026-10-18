@@ -325,9 +325,11 @@ def ue_state(log):
     txt = strip_ansi(p.stdout or "")
     if "Initial Registration is successful" in txt:
         return "success", txt
+    # Do not treat "Authentication Failure" generically as terminal:
+    # UERANSIM can legitimately send a 5G-AKA synchronization failure (AUTS)
+    # and then complete registration after AMF/AUSF resynchronization.
     failure_markers = [
         "Registration reject",
-        "Authentication failure",
         "PLMN selection failure",
         "No cells in coverage",
     ]
@@ -341,9 +343,21 @@ def stop_ue(pidf):
         check=False,
     )
 
+def amf_completed_supis(start_epoch, supis):
+    txt = get_logs_since("amf", start_epoch)
+    completed = set()
+    for line in txt.splitlines():
+        if "Handle Registration Complete" not in line:
+            continue
+        for supi in supis:
+            if f"SUPI:{supi}" in line:
+                completed.add(supi)
+    return completed
+
 def run_ues(supis, configs, timeout_s=6.0):
     handles = []
     start = time.perf_counter()
+    wall_start = time.time()
     for supi in supis:
         handles.append(start_ue(supi, configs[supi]))
 
@@ -359,8 +373,8 @@ def run_ues(supis, configs, timeout_s=6.0):
     logs = {s: "" for s in supis}
     success_time = {}
     deadline = time.perf_counter() + timeout_s
+    last_amf_check = 0.0
     while time.perf_counter() < deadline:
-        done = True
         for supi, (safe, log, pidf) in zip(supis, handles):
             if states[supi] == "pending":
                 state, txt = ue_state(log)
@@ -369,11 +383,20 @@ def run_ues(supis, configs, timeout_s=6.0):
                     states[supi] = state
                     if state == "success":
                         success_time[supi] = (time.perf_counter() - start) * 1000.0
-                else:
-                    done = False
-        if done:
+
+        # AMF's "Handle Registration Complete" is the authoritative control-plane
+        # confirmation. It also avoids false negatives caused by buffered UE logs.
+        now = time.perf_counter()
+        if now - last_amf_check >= 0.20:
+            for supi in amf_completed_supis(wall_start, supis):
+                if states[supi] == "pending":
+                    states[supi] = "success"
+                    success_time[supi] = (now - start) * 1000.0
+            last_amf_check = now
+
+        if all(states[s] != "pending" for s in supis):
             break
-        time.sleep(0.12)
+        time.sleep(0.08)
     for supi, (_, log, pidf) in zip(supis, handles):
         state, txt = ue_state(log)
         logs[supi] = txt
@@ -381,8 +404,8 @@ def run_ues(supis, configs, timeout_s=6.0):
             states[supi] = state
         stop_ue(pidf)
     telemetry_thread.join(timeout=8.0)
-    stats = telemetry.get("stats", docker_stats())
-    probes = telemetry.get("probes", all_probes())
+    stats = telemetry["stats"] if "stats" in telemetry else docker_stats()
+    probes = telemetry["probes"] if "probes" in telemetry else all_probes()
     successes = [s for s in supis if states[s] == "success"]
     lat = [success_time[s] for s in successes if s in success_time]
     return {
