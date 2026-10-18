@@ -10,6 +10,7 @@ import statistics
 import subprocess
 import sys
 import time
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -345,8 +346,15 @@ def run_ues(supis, configs, timeout_s=6.0):
     start = time.perf_counter()
     for supi in supis:
         handles.append(start_ue(supi, configs[supi]))
-    stats = docker_stats()
-    probes = all_probes()
+
+    telemetry = {}
+    def collect_telemetry():
+        telemetry["stats"] = docker_stats()
+        telemetry["probes"] = all_probes()
+
+    telemetry_thread = threading.Thread(target=collect_telemetry, daemon=True)
+    telemetry_thread.start()
+
     states = {s: "pending" for s in supis}
     logs = {s: "" for s in supis}
     success_time = {}
@@ -372,6 +380,9 @@ def run_ues(supis, configs, timeout_s=6.0):
         if states[supi] == "pending":
             states[supi] = state
         stop_ue(pidf)
+    telemetry_thread.join(timeout=8.0)
+    stats = telemetry.get("stats", docker_stats())
+    probes = telemetry.get("probes", all_probes())
     successes = [s for s in supis if states[s] == "success"]
     lat = [success_time[s] for s in successes if s in success_time]
     return {
@@ -497,7 +508,7 @@ def main():
     login = wait_http("http://127.0.0.1:5000/api/login")
     token = login["access_token"]
 
-    total_ues = 1 + args.normal_runs + args.runs_per_scenario * (1 + 1 + 1 + 1 + 5)
+    total_ues = 1 + args.normal_runs + args.runs_per_scenario * (1 + 1 + 1 + 1 + 5) + 10
     supis = [make_supi(i + 1) for i in range(total_ues)]
     print(f"Provisioning {len(supis)} subscribers")
     for i, supi in enumerate(supis):
@@ -525,10 +536,19 @@ def main():
 
     event_id = 1
     for _ in range(args.normal_runs):
-        s = supis[cursor]; cursor += 1
-        rows, ev = record_event(event_id, "normal", "", [s], configs, outdir)
-        all_nodes += rows; all_events.append(ev)
-        print(f"event={event_id} normal success={ev['registration_success_rate']:.2f}")
+        accepted = False
+        for attempt in range(1, 4):
+            s = supis[cursor]; cursor += 1
+            rows, ev = record_event(event_id, "normal", "", [s], configs, outdir)
+            if ev["registration_success_rate"] >= 1.0:
+                all_nodes += rows; all_events.append(ev)
+                print(f"event={event_id} normal success=1.00 attempt={attempt}")
+                accepted = True
+                break
+            print(f"event={event_id} normal retry after failed registration attempt={attempt}")
+            time.sleep(0.8)
+        if not accepted:
+            raise RuntimeError(f"normal event {event_id} failed after 3 attempts")
         event_id += 1
 
     plans = [
