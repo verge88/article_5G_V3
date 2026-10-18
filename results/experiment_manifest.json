@@ -1,0 +1,22 @@
+{
+  "nodes": ["AMF","SMF","UDM","AUSF","PCF","NRF","NSSF","CHF"],
+  "features": ["req_rate","latency","error_rate","cpu","memory","streams","route_entropy","probe_latency","probe_loss","probe_staleness","report_inconsistency","zone_req_dev","zone_lat_dev","neighbor_error_dev"],
+  "window": 12,
+  "train_interval": [12,899],
+  "validation_interval": [900,1199],
+  "test_interval": [1200,2399],
+  "scenarios": {
+    "signaling_storm": {"start":1300,"end":1380,"target":"AMF"},
+    "http2_dos": {"start":1500,"end":1580,"target":"NRF"},
+    "nf_degradation": {"start":1750,"end":1830,"target":"PCF"},
+    "stealth_compromise_smf": {"start":2050,"end":2150,"target":"SMF"},
+    "stealth_compromise_amf": {"start":2250,"end":2330,"target":"AMF"}
+  },
+  "methods": ["Ablation_concat_probe","Ablation_no_graph","Ablation_no_probe","Ablation_no_temporal","Ablation_no_zone","IsolationForest","LSTM","OneClassSVM","Proposed","TemporalGNN"],
+  "seeds": [11,29,47,71,101],
+  "threshold_policy": "99th percentile of validation-normal node scores",
+  "primary_detection_task": "network-level attack detection; node scores are used separately for localization",
+  "data_status": "controlled synthetic/digital-twin 5G SBA telemetry, not operator traffic",
+  "github_actions_run": 39119543125,
+  "artifact_id": 12134140197
+}
