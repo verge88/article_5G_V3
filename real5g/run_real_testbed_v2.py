@@ -431,9 +431,13 @@ def configure_fault(node, event_id, kind, canary_supi="", phase="canary"):
     set_all_none(event_id)
     if not node:
         return
-    exclude = canary_supi if kind == "evasion_delay" and phase == "canary" else ""
+    if kind == "evasion_delay" and phase == "canary":
+        # Adversarial upper bound: the compromised NF recognizes the control
+        # transaction/window and behaves normally only while the canary runs.
+        set_proxy(node, event_id, mode="none")
+        return
     if kind in ("delay", "evasion_delay"):
-        set_proxy(node, event_id, mode="delay", delay_ms=30 if kind == "delay" else 45, exclude_token=exclude)
+        set_proxy(node, event_id, mode="delay", delay_ms=30 if kind == "delay" else 45)
     elif kind == "jitter":
         set_proxy(node, event_id, mode="jitter", jitter_ms=45)
     elif kind == "error":
@@ -442,16 +446,23 @@ def configure_fault(node, event_id, kind, canary_supi="", phase="canary"):
 
 def scenario_schedule(replicate):
     items = []
-    def add(name, count, label, target="", kind="", workload=1, family=""):
+    def add(name, count, label, target="", kind="", workload=1, family="", post_sleep_s=0):
         for _ in range(count):
             items.append({
                 "scenario": name, "label": label, "target_node": target,
                 "fault_kind": kind, "workload_ues": workload, "family": family or name,
+                "post_sleep_s": post_sleep_s,
             })
 
     add("normal", 40, 0, workload=1, family="legitimate")
     add("benign_burst", 8, 0, workload=3, family="legitimate")
     add("benign_heavy_load", 8, 0, workload=5, family="legitimate")
+    # Medium-duration stability/drift samples. These are legitimate events,
+    # distributed through the shuffled sequence; each inserts a 20 s gap so
+    # the full run spans materially more wall-clock time and three load levels.
+    add("drift_normal_1ue", 8, 0, workload=1, family="drift_legitimate", post_sleep_s=20)
+    add("drift_normal_3ue", 8, 0, workload=3, family="drift_legitimate", post_sleep_s=20)
+    add("drift_normal_5ue", 8, 0, workload=5, family="drift_legitimate", post_sleep_s=20)
     for node in TARGET_NODES:
         add(f"selective_delay_{node.lower()}", 5, 1, target=node, kind="delay", family="selective_delay")
     for node in ("AUSF", "UDM"):
@@ -668,6 +679,8 @@ def main():
             f"effective={event['fault_effective']} canary={event['canary_registration_latency_ms']:.1f}ms "
             f"workload={event['workload_registration_latency_ms']:.1f}ms"
         )
+        if int(desc.get("post_sleep_s", 0)) > 0:
+            time.sleep(int(desc["post_sleep_s"]))
 
     nodes = pd.DataFrame(all_nodes)
     events = pd.DataFrame(all_events)
@@ -683,8 +696,10 @@ def main():
         "target_nodes": TARGET_NODES,
         "passive_nodes": list(PASSIVE_NODES),
         "fault_semantics": "Selective business-path HTTP/2 proxy fault; root / is never delayed by selective faults.",
-        "evasion_semantics": "Canary SUPI is exempted during canary phase but ordinary workload remains impaired.",
+        "evasion_semantics": "Adversarial upper-bound: manipulation is suspended during the recognizable canary/control window and resumed for ordinary workload.",
         "blackbox": "Prometheus blackbox_exporter probes the registered root endpoint.",
+        "transport_security": "Pinned free5GC compose uses h2c/HTTP for SBI. The proxy is internal and forwards request headers transparently; mTLS termination is not evaluated and remains a deployment limitation.",
+        "drift_design": "24 legitimate drift/stability events per runner at 1/3/5 UE loads, each separated by 20 seconds and shuffled with other scenarios.",
         "active_control": "A real UERANSIM canary UE registration traversing NAS/NGAP and SBI business APIs.",
         "zone_features": "Not computed during collection; derived fold-wise from per-NF normal baselines to avoid leakage.",
     }
