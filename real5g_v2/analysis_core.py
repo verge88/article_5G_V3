@@ -164,7 +164,7 @@ def crossfit_calibration(nodes, events, outer_train_blocks, method):
         scores.extend(es[es.event_id.isin(normal_ids)].score.tolist())
     return np.asarray(scores, dtype=float)
 
-def simple_scores(test_t, event_z, test_events):
+def simple_scores(test_t, event_z, test_events, stats):
     rows = []
     for event_id, g in test_t.groupby("event_id"):
         cand = g[g.node.isin(CANDIDATES)].copy()
@@ -182,11 +182,18 @@ def simple_scores(test_t, event_z, test_events):
         stage_score = float(stage.max())
         stage_node = cand.loc[stage.idxmax(), "node"]
 
-        # SLO alert: failure or latency more than four robust scales above the
-        # role-specific normal median. The 0.10 ms scale floor is applied in fit_stats.
-        slo_violation = cand.z_blackbox_latency_ms.astype(float) - 4.0
-        slo_arr = slo_violation.values.copy()
-        slo_arr[bad] = np.maximum(slo_arr[bad], 10.0)
+        # Standard blackbox/SLO-style alert. Each NF has its own normal baseline.
+        # The alert threshold is median + max(10 ms, 4 robust scales), so a near-zero
+        # MAD cannot create an unrealistically tight availability SLO.
+        slo_arr = []
+        for _, r in cand.iterrows():
+            _, scale = stats[r.node]["blackbox_latency_ms"]
+            threshold_z = max(4.0, 10.0 / scale)
+            violation = float(r.z_blackbox_latency_ms) - threshold_z
+            if int(r.blackbox_success) == 0:
+                violation = max(violation, 10.0)
+            slo_arr.append(violation)
+        slo_arr = np.asarray(slo_arr, dtype=float)
         slo_score = float(np.max(slo_arr))
         slo_node = cand.iloc[int(np.argmax(slo_arr))].node
 
@@ -207,7 +214,7 @@ def outer_fold(nodes, events, test_block):
     test_t = transformed[transformed.block_id == test_block].copy()
     test_e = events[events.block_id == test_block].copy()
 
-    parts = [simple_scores(test_t, event_z, test_e)]
+    parts = [simple_scores(test_t, event_z, test_e, stats)]
     node_parts = []
     for method in ML_METHODS:
         cal = crossfit_calibration(nodes, events, train_blocks, method)
