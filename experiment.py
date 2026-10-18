@@ -340,6 +340,8 @@ def run_seed(seed):
     deep_specs = [
         ("LSTM", LOCAL_IDX, LOCAL_IDX, None, False, True),
         ("TemporalGNN", LOCAL_IDX+ZONE_IDX, LOCAL_IDX+ZONE_IDX, None, True, True),
+        ("Ablation_no_probe", LOCAL_IDX+ZONE_IDX, LOCAL_IDX+ZONE_IDX, None, True, True),
+        ("Ablation_concat_probe", list(range(len(FEATURE_NAMES))), list(range(len(FEATURE_NAMES))), None, True, True),
         ("Proposed", LOCAL_IDX+ZONE_IDX, list(range(len(FEATURE_NAMES))), PROBE_IDX, True, True),
         ("Ablation_no_zone", LOCAL_IDX, LOCAL_IDX+PROBE_IDX, PROBE_IDX, True, True),
         ("Ablation_no_graph", list(range(len(FEATURE_NAMES))), list(range(len(FEATURE_NAMES))), PROBE_IDX, False, True),
@@ -370,8 +372,8 @@ def save_outputs(outdir, metrics, scenarios, timeline):
     agg=agg.reset_index()
     agg.to_csv(out/"metrics_summary.csv",index=False)
 
-    full_order=["IsolationForest","OneClassSVM","LSTM","TemporalGNN","Proposed",
-                "Ablation_no_zone","Ablation_no_graph","Ablation_no_temporal"]
+    full_order=["IsolationForest","OneClassSVM","LSTM","TemporalGNN","Ablation_no_probe",
+                "Ablation_concat_probe","Proposed","Ablation_no_zone","Ablation_no_graph","Ablation_no_temporal"]
     order=[m for m in full_order if m in set(agg.method)]
     plotdf=agg.set_index("method").loc[order]
     ax=plotdf[["f1_mean","stealth_recall_mean","localization_top1_mean"]].plot(kind="bar",figsize=(11,5))
