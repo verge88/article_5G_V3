@@ -287,10 +287,10 @@ def active_stage_latencies(logs, ue_log, supi):
         amf,
         lambda l: f"SUPI:{supi}" in l and "Send Registration Accept" in l,
     )
-    ue_accept = None
-    for line in ue_log.splitlines():
-        if "Registration accept received" in line:
-            ue_accept = parse_ue_ts(line)
+    t_amf_complete = last_time(
+        amf,
+        lambda l: f"SUPI:{supi}" in l and "Handle Registration Complete" in l,
+    )
 
     def gap(a, b):
         if a is None or b is None or b < a:
@@ -301,7 +301,7 @@ def active_stage_latencies(logs, ue_log, supi):
         "UDR": gap(t_udr, t_udm),
         "UDM": gap(t_udm, t_ausf_ready),
         "AUSF": gap(t_ausf_ready, t_amf_auth),
-        "AMF": gap(t_amf_accept, ue_accept),
+        "AMF": gap(t_amf_accept, t_amf_complete),
     }
 
 def summarize_business_logs(txt):
