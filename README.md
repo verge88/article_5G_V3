@@ -59,3 +59,9 @@ The GitHub Actions workflow runs three independent seeds and uploads:
 - `summary.md`.
 
 Important limitation: the current CI experiment uses a controlled 5G-SBA digital-twin simulator. It does **not** claim to use real operator traffic or a production 5G core. This limitation is intentionally preserved in all generated summaries.
+
+## Final GitHub Actions result
+
+The five-seed experiment completed successfully in GitHub Actions. See [RESULTS.md](RESULTS.md) for the scientific interpretation and [results/manuscript_table.md](results/manuscript_table.md) for the aggregate table.
+
+The strongest validated effect is the active-probe channel: stealth top-1 localization is 0.9489 for the proposed detector versus 0.0722 without probes. Zone context reduces FPR, while the current experiment does not independently justify claiming gains from the trust gate, graph block, or temporal block.
