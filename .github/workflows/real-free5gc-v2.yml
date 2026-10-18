@@ -1,0 +1,147 @@
+name: Real free5GC + UERANSIM experiment v2
+
+on:
+  push:
+    branches: [real-free5gc-v2-ci]
+    paths:
+      - V2_TRIGGER
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  real-5g-v2:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      FREE5GC_COMPOSE_SHA: "235ef1b91ceacebb07f4118384f2c4190f431098"
+      FREE5GC_IMAGE_TAG: "v4.3.0"
+      FREE5GC_ADDITIONAL_IMAGE_TAG: "latest"
+      PYTHONHASHSEED: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
+          docker system prune -af || true
+          df -h
+
+      - name: Install host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl iproute2 tcpdump lksctp-tools
+          sudo modprobe sctp || true
+          sudo mkdir -p /dev/net
+          if [ ! -e /dev/net/tun ]; then
+            sudo mknod /dev/net/tun c 10 200
+          fi
+          sudo chmod 666 /dev/net/tun
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install analysis dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy==2.1.3 pandas==2.2.3 scikit-learn==1.5.2 matplotlib==3.9.2 tabulate==0.9.0
+
+      - name: Clone pinned free5GC compose
+        run: |
+          git clone https://github.com/free5gc/free5gc-compose.git testbed/free5gc-compose
+          cd testbed/free5gc-compose
+          git checkout "$FREE5GC_COMPOSE_SHA"
+          echo "$FREE5GC_COMPOSE_SHA" > ../../free5gc-compose.sha
+
+      - name: Start real 5G control plane
+        working-directory: testbed/free5gc-compose
+        run: |
+          set -euxo pipefail
+          export COMPOSE_PROJECT_NAME=free5gc
+          docker compose pull db free5gc-nrf free5gc-nssf free5gc-udr free5gc-udm free5gc-ausf free5gc-pcf free5gc-amf free5gc-webui ueransim
+          docker compose up -d db
+          sleep 3
+          docker compose up -d free5gc-nrf
+          sleep 3
+          docker compose up -d free5gc-nssf free5gc-udr free5gc-udm free5gc-ausf free5gc-pcf free5gc-amf free5gc-webui
+          docker compose up -d --no-deps free5gc-smf || true
+          sleep 12
+          docker compose up -d --no-deps ueransim
+          sleep 8
+          docker ps -a
+          docker logs --tail 60 ueransim
+          docker logs --tail 80 amf
+
+      - name: Start Prometheus blackbox exporter
+        run: |
+          set -euxo pipefail
+          NET="$(docker network ls --format '{{.Name}}' | grep '^free5gc_privnet$' | head -1)"
+          test -n "$NET"
+          docker run -d --name blackbox-exporter             --network "$NET" -p 9115:9115             -v "$GITHUB_WORKSPACE/real5g_v2/blackbox.yml:/config/blackbox.yml:ro"             prom/blackbox-exporter:v0.28.0             --config.file=/config/blackbox.yml
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:9115/-/healthy && break
+            sleep 1
+          done
+          curl -fsS "http://127.0.0.1:9115/probe?module=http_liveness&target=http%3A%2F%2Fnrf.free5gc.org%3A8000%2F" | grep '^probe_success'
+
+      - name: Validate Python modules
+        run: |
+          python -m py_compile real5g_v2/run_experiment_v2.py
+          python -m py_compile real5g_v2/analysis_core.py
+          python -m py_compile real5g_v2/evaluate_v2.py
+
+      - name: Collect interleaved blocked dataset
+        run: |
+          set -euxo pipefail
+          mkdir -p results_real5g_v2/raw_logs
+          sudo tcpdump -i br-free5gc -s 192 -w results_real5g_v2/control_plane_v2.pcap '(tcp port 8000) or sctp' >/tmp/tcpdump-v2.log 2>&1 &
+          echo $! > /tmp/tcpdump-v2.pid
+          python real5g_v2/run_experiment_v2.py --out results_real5g_v2 --blocks 8 --subscriber-pool 480
+          sudo kill "$(cat /tmp/tcpdump-v2.pid)" || true
+          sleep 1
+          SBI_PACKETS="$(sudo tcpdump -nn -r results_real5g_v2/control_plane_v2.pcap 'tcp port 8000' 2>/dev/null | wc -l)"
+          SCTP_PACKETS="$(sudo tcpdump -nn -r results_real5g_v2/control_plane_v2.pcap 'sctp' 2>/dev/null | wc -l)"
+          printf '{"sbi_tcp_8000_packets":%s,"sctp_packets":%s}\n' "$SBI_PACKETS" "$SCTP_PACKETS" > results_real5g_v2/pcap_evidence_v2.json
+          test "$SBI_PACKETS" -gt 0
+          test "$SCTP_PACKETS" -gt 0
+
+      - name: Run blocked cross-validation and statistics
+        run: |
+          python real5g_v2/evaluate_v2.py             --nodes results_real5g_v2/nodes_v2.csv             --events results_real5g_v2/events_v2.csv             --out results_real5g_v2
+          cat results_real5g_v2/summary_v2.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save reproducibility evidence
+        if: always()
+        run: |
+          mkdir -p results_real5g_v2/final_logs
+          for c in nrf amf ausf udm udr nssf pcf smf ueransim webui mongodb blackbox-exporter; do
+            docker logs "$c" > "results_real5g_v2/final_logs/${c}.log" 2>&1 || true
+          done
+          docker ps -a > results_real5g_v2/docker_ps.txt || true
+          docker images --digests > results_real5g_v2/docker_images.txt || true
+          docker inspect nrf amf ausf udm udr nssf pcf smf ueransim blackbox-exporter > results_real5g_v2/docker_inspect.json 2>/dev/null || true
+          cp free5gc-compose.sha results_real5g_v2/ || true
+          sudo chown -R "$USER":"$USER" results_real5g_v2 || true
+          du -sh results_real5g_v2 || true
+
+      - name: Upload complete v2 artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-free5gc-ueransim-v2-results
+          path: results_real5g_v2/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Tear down
+        if: always()
+        working-directory: testbed/free5gc-compose
+        run: |
+          export COMPOSE_PROJECT_NAME=free5gc
+          docker rm -f blackbox-exporter || true
+          docker compose down -v --remove-orphans || true
