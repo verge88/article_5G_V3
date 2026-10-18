@@ -1,0 +1,55 @@
+name: 5G SBA full experiment
+
+on:
+  push:
+    branches: [experiment-ci]
+    paths:
+      - TRIGGER
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  experiment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      PYTHONHASHSEED: "0"
+      OMP_NUM_THREADS: "2"
+      MKL_NUM_THREADS: "2"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements.txt
+
+      - name: Run reproducible experiment
+        run: |
+          python experiment.py --out results --seeds 11 29 47
+
+      - name: Show headline results
+        if: always()
+        run: |
+          if [ -f results/summary.md ]; then
+            cat results/summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload complete experiment artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: article-5g-v3-results
+          path: results/
+          if-no-files-found: error
+          retention-days: 30
