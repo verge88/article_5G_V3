@@ -1,0 +1,205 @@
+name: Revised real free5GC experiment
+
+on:
+  push:
+    branches: [real-free5gc-v2]
+    paths:
+      - V2_TRIGGER
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    name: collect-replicate-${{ matrix.replicate }}
+    strategy:
+      fail-fast: false
+      matrix:
+        replicate: [1, 2, 3]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      FREE5GC_COMPOSE_SHA: "235ef1b91ceacebb07f4118384f2c4190f431098"
+      FREE5GC_IMAGE_TAG: "v4.3.0"
+      FREE5GC_ADDITIONAL_IMAGE_TAG: "latest"
+      PYTHONHASHSEED: "0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
+          docker system prune -af || true
+          df -h
+
+      - name: Install host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl iproute2 tcpdump lksctp-tools
+          sudo modprobe sctp || true
+          sudo mkdir -p /dev/net
+          if [ ! -e /dev/net/tun ]; then
+            sudo mknod /dev/net/tun c 10 200
+          fi
+          sudo chmod 666 /dev/net/tun
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install collector dependencies
+        run: python -m pip install pandas==2.2.3
+
+      - name: Build selective SBI proxy
+        run: docker build -t sbi-fault-proxy:local real5g/proxy
+
+      - name: Clone and patch pinned free5GC compose
+        run: |
+          git clone https://github.com/free5gc/free5gc-compose.git testbed/free5gc-compose
+          cd testbed/free5gc-compose
+          git checkout "$FREE5GC_COMPOSE_SHA"
+          sed -i 's/registerIPv4: ausf\.free5gc\.org/registerIPv4: ausf-proxy.free5gc.org/' config/ausfcfg.yaml
+          sed -i 's/registerIPv4: udm\.free5gc\.org/registerIPv4: udm-proxy.free5gc.org/' config/udmcfg.yaml
+          sed -i 's/registerIPv4: udr\.free5gc\.org/registerIPv4: udr-proxy.free5gc.org/' config/udrcfg.yaml
+          grep -R 'registerIPv4:' config/{ausf,udm,udr}cfg.yaml
+          echo "$FREE5GC_COMPOSE_SHA" > ../../free5gc-compose.sha
+
+      - name: Start database, proxies and blackbox exporter
+        working-directory: testbed/free5gc-compose
+        run: |
+          set -euxo pipefail
+          export COMPOSE_PROJECT_NAME=free5gc
+          docker compose pull db free5gc-nrf free5gc-nssf free5gc-udr free5gc-udm free5gc-ausf free5gc-pcf free5gc-amf free5gc-webui ueransim
+          docker compose up -d db
+          sleep 3
+
+          docker run -d --name sbi-proxy-ausf --network free5gc_privnet \
+            --network-alias ausf-proxy.free5gc.org \
+            -e PROXY_ID=AUSF -e UPSTREAM=http://ausf.free5gc.org:8000 sbi-fault-proxy:local
+          docker run -d --name sbi-proxy-udm --network free5gc_privnet \
+            --network-alias udm-proxy.free5gc.org \
+            -e PROXY_ID=UDM -e UPSTREAM=http://udm.free5gc.org:8000 sbi-fault-proxy:local
+          docker run -d --name sbi-proxy-udr --network free5gc_privnet \
+            --network-alias udr-proxy.free5gc.org \
+            -e PROXY_ID=UDR -e UPSTREAM=http://udr.free5gc.org:8000 sbi-fault-proxy:local
+
+          docker run -d --name blackbox-exporter --network free5gc_privnet -p 9115:9115 \
+            -v "$GITHUB_WORKSPACE/real5g/blackbox.yml:/config/blackbox.yml:ro" \
+            prom/blackbox-exporter:v0.28.0 --config.file=/config/blackbox.yml
+
+      - name: Start real 5G control plane
+        working-directory: testbed/free5gc-compose
+        run: |
+          set -euxo pipefail
+          export COMPOSE_PROJECT_NAME=free5gc
+          docker compose up -d free5gc-nrf
+          sleep 3
+          docker compose up -d free5gc-nssf free5gc-udr free5gc-udm free5gc-ausf free5gc-pcf free5gc-amf free5gc-webui
+          docker compose up -d --no-deps free5gc-smf || true
+          sleep 12
+          docker compose up -d --no-deps ueransim
+          sleep 8
+          docker logs --tail 80 ueransim
+          docker logs --tail 80 amf
+          curl -fsS http://127.0.0.1:9115/-/healthy
+
+      - name: Run interleaved collection
+        run: |
+          mkdir -p "results_v2_rep${{ matrix.replicate }}/raw_logs"
+          sudo tcpdump -i br-free5gc -s 256 \
+            -w "results_v2_rep${{ matrix.replicate }}/sbi_ngap_capture.pcap" \
+            '(tcp port 8000) or sctp' >/tmp/tcpdump.log 2>&1 &
+          echo $! >/tmp/tcpdump.pid
+
+          python real5g/run_real_testbed_v2.py \
+            --out "results_v2_rep${{ matrix.replicate }}" \
+            --replicate "${{ matrix.replicate }}"
+
+          sudo kill "$(cat /tmp/tcpdump.pid)" || true
+          sleep 1
+          PCAP="results_v2_rep${{ matrix.replicate }}/sbi_ngap_capture.pcap"
+          SBI="$(sudo tcpdump -nn -r "$PCAP" 'tcp port 8000' 2>/dev/null | wc -l)"
+          SCTP="$(sudo tcpdump -nn -r "$PCAP" 'sctp' 2>/dev/null | wc -l)"
+          printf '{"sbi_tcp_8000_packets":%s,"sctp_packets":%s}\n' "$SBI" "$SCTP" \
+            > "results_v2_rep${{ matrix.replicate }}/pcap_evidence.json"
+          test "$SBI" -gt 0
+          test "$SCTP" -gt 0
+          sudo chown -R "$USER":"$USER" "results_v2_rep${{ matrix.replicate }}"
+
+      - name: Preserve runtime evidence
+        if: always()
+        run: |
+          OUT="results_v2_rep${{ matrix.replicate }}"
+          mkdir -p "$OUT/runtime_logs"
+          for c in nrf amf ausf udm udr nssf ueransim webui mongodb \
+                   sbi-proxy-ausf sbi-proxy-udm sbi-proxy-udr blackbox-exporter; do
+            docker logs "$c" > "$OUT/runtime_logs/${c}.log" 2>&1 || true
+          done
+          docker ps -a > "$OUT/docker_ps.txt" || true
+          docker images --digests > "$OUT/docker_images.txt" || true
+          cp free5gc-compose.sha "$OUT/" || true
+          sudo chown -R "$USER":"$USER" "$OUT" || true
+
+      - name: Upload replicate
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real5g-v2-rep-${{ matrix.replicate }}
+          path: results_v2_rep${{ matrix.replicate }}/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Tear down
+        if: always()
+        working-directory: testbed/free5gc-compose
+        run: |
+          export COMPOSE_PROJECT_NAME=free5gc
+          docker rm -f sbi-proxy-ausf sbi-proxy-udm sbi-proxy-udr blackbox-exporter || true
+          docker compose down -v --remove-orphans || true
+
+  analyze:
+    name: cross-runner-analysis
+    needs: collect
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all runner replicates
+        uses: actions/download-artifact@v4
+        with:
+          pattern: real5g-v2-rep-*
+          path: collected
+          merge-multiple: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install analysis dependencies
+        run: |
+          python -m pip install \
+            numpy==2.1.3 pandas==2.2.3 scikit-learn==1.5.2 \
+            matplotlib==3.9.2 tabulate==0.9.0
+
+      - name: Analyze with leave-one-runner-out validation
+        run: |
+          python real5g/analyze_real_testbed_v2.py \
+            --input-dir collected \
+            --out results_v2 \
+            --bootstrap 1000
+          cat results_v2/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload aggregate results
+        uses: actions/upload-artifact@v4
+        with:
+          name: real5g-v2-aggregate-results
+          path: results_v2/
+          if-no-files-found: error
+          retention-days: 30
