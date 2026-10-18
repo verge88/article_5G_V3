@@ -1,0 +1,12 @@
+{
+  "github_actions_run": 39121474105,
+  "artifact_id": 12134227722,
+  "artifact_sha256": "09983f93fb44fce472ac663ff1beb3c5011e749b39a9dd79624a791cf7de3208",
+  "free5gc_compose_sha": "235ef1b91ceacebb07f4118384f2c4190f431098",
+  "free5gc_image_tag": "v4.3.0",
+  "ueransim_runtime_version": "v3.3.0",
+  "sbi_tcp_8000_packets": 46838,
+  "sctp_packets": 1448,
+  "normal_registration_failures": 0,
+  "validation_scope": "5G Core control plane; no PDU session/user-plane benchmark"
+}
