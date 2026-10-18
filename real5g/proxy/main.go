@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,7 +13,6 @@ import (
 	"net/url"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -293,13 +291,7 @@ func main() {
 		Addr:              ":8000",
 		Handler:           h2c.NewHandler(handler, &http2.Server{}),
 		ReadHeaderTimeout: 10 * time.Second,
-		BaseContext: func(netListener interface{ Addr() fmt.Stringer }) context.Context {
-			return context.Background()
-		},
 	}
-	// BaseContext signature differs by Go version; keep default by replacing below.
-	_ = strconv.IntSize
-	server.BaseContext = nil
 
 	log.Printf("%s proxy listening on :8000 -> %s", id, upstream.String())
 	log.Fatal(server.ListenAndServe())
